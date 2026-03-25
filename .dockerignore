@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+__pycache__
+*.pyc
+.pytest_cache
+.vscode
+.idea
+.devcontainer
+docker-compose.yml
+docker-compose.override.yml
+.dockerignore
+README.md
+LICENSE
