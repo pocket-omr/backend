@@ -1,6 +1,6 @@
 services:
   pgsql:
-    container_name: omr-test-pgsql
+    container_name: omr-pgsql
     image: postgres:16-alpine
     # restart: unless-stopped
     environment:
@@ -15,26 +15,8 @@ services:
       timeout: 5s
       retries: 5
 
-  api:
-    container_name: omr-test-api
-    build: .
-    # restart: unless-stopped
-    env_file: .env
-    depends_on:
-      pgsql:
-        condition: service_healthy
-    ports:
-      - "${API_PORT}:80"
-    develop:
-      watch:
-        - action: sync+restart
-          path: .
-          target: /code
-        - action: rebuild
-          path: requirements.txt
-
   minio:
-    container_name: omr-test-minio
+    container_name: omr-minio
     image: minio/minio
     command: server /data --console-address ":9001"
     environment:

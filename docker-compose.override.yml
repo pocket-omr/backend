@@ -1,7 +1,4 @@
 services:
   pgsql:
     ports:
-      - "5432:5432"   # expose locally so you can connect with psql/DBeaver
-  api:
-    volumes:
-      - .:/code
+      - "5433:5432"   # expose locally so you can connect with psql/DBeaver

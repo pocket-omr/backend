@@ -1,0 +1,12 @@
+[lint]
+select = ["E", "F", "W", "UP", "B", "A", "C4", "PIE", "SIM", "RUF"]
+ignore = ["E501"]  # line too long (rely on formatter)
+line-length = 100
+
+[format]
+line-length = 100
+quote-style = "double"
+indent-style = "space"
+
+[per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__

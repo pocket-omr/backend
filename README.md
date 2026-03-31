@@ -9,10 +9,11 @@
 
 ## Services and ports
 
-- API: host port from `API_PORT` -> container 80
+- Dev API (venv): `http://localhost:8000`
 - PostgreSQL: `5432` (exposed in override compose file)
 - MinIO API: `9000`
 - MinIO Console: `9001`
+- Production-style API container (optional local check): host port from `API_PORT` -> container `80`
 
 ## Required environment variables
 
@@ -29,7 +30,7 @@ MINIO_ROOT_PASSWORD=minio123
 
 ## Quick start
 
-Use this flow if you are a frontend or mobile teammate and need a local backend to integrate against.
+In development, API is run from local venv. Docker Compose is used only for dependencies (`pgsql` and `minio`).
 
 1. Create local env file:
 
@@ -37,13 +38,32 @@ Use this flow if you are a frontend or mobile teammate and need a local backend 
 cp .env.example .env
 ```
 
-2. Start the backend stack (API + Postgres + MinIO):
+2. Start dependencies:
 
 ```bash
-docker compose up --build -d
+docker compose up -d
 ```
 
-3. Check that API is running:
+3. Create and activate venv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+4. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+5. Run API locally:
+
+```bash
+fastapi dev app/main.py --port 8000
+```
+
+6. Check that API is running:
 
 ```bash
 curl http://localhost:8000/health
@@ -55,52 +75,92 @@ Expected response:
 {"status":"ok"}
 ```
 
-4. Base URL to use in clients:
+7. Base URL to use in clients:
 
 - Frontend running on same machine: `http://localhost:8000`
 - Physical phone on same Wi-Fi: `http://<your-computer-lan-ip>:8000`
 - Android emulator: `http://10.0.2.2:8000`
 - iOS simulator: `http://localhost:8000`
 
-5. Optional check in browser:
+8. Optional check in browser:
 
 - API root: `http://localhost:8000/`
 - MinIO console: `http://localhost:9001`
 
-6. View logs when debugging integration:
+9. View dependency logs when debugging integration:
 
 ```bash
-docker compose logs -f api
+docker compose logs -f pgsql minio
 ```
 
-7. Stop services:
+10. Stop services:
 
 ```bash
 docker compose down
 ```
 
-## Dev Container
+## Production-style container check (optional)
 
-This repo includes VS Code Dev Container configuration.
+Use this only when you want to validate the API container path locally.
 
-1. Open folder in VS Code
-2. Press Ctrl + Shift + P
-3. Run “Dev Containers: Reopen in Container”
-4. Work inside the api service container
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
+
+Stop production-style stack:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+```
+
+## Linting and Formatting
+
+This project uses Ruff for linting and code formatting.
+
+Check lint issues:
+```bash
+ruff check app/
+```
+
+Fix auto-fixable issues:
+```bash
+ruff check --fix app/
+```
+
+Format code:
+```bash
+ruff format app/
+```
+
+Combined check and format:
+```bash
+ruff check --fix app/ && ruff format app/
+```
+
+### Pre-commit hook setup (optional)
+
+Run linting automatically before each commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+From now on, `ruff check --fix` and `ruff format` will run on staged files before each commit. To bypass (not recommended):
+```bash
+git commit --no-verify
+```
 
 ## Testing
+
 For this project we're using `pytest` as a testing framework.
 Use these commands to run tests:
 ```bash
-docker compose run --rm api pytest
+pytest
 ```
 For verbose output:
 ```bash
-docker compose run --rm api pytest -v
-```
-If the containers are already running, you can also execute tests in the running api service like this:
-```bash
-docker compose exec api pytest
+pytest -v
 ```
 
 Consider making a `/tests` directory to organize your test suite.
@@ -110,24 +170,24 @@ Consider making a `/tests` directory to organize your test suite.
 This project uses Alembic for schema migrations.
 
 Initialize Alembic (run once):
-1. `docker compose run --rm api alembic init alembic`
+1. `alembic init alembic`
 2. This creates:
    - `alembic.ini`
    - `alembic/env.py`
    - `alembic/versions/`
 
 Create a migration:
-1. `docker compose run --rm api alembic revision -m "describe change"`
+1. `alembic revision -m "describe change"`
 
 Apply migrations:
-1. `docker compose run --rm api alembic upgrade head`
+1. `alembic upgrade head`
 
 Rollback one migration:
-1. `docker compose run --rm api alembic downgrade -1`
+1. `alembic downgrade -1`
 
 Useful checks:
-1. `docker compose run --rm api alembic current`
-2. `docker compose run --rm api alembic history`
+1. `alembic current`
+2. `alembic history`
 
 ## Git Workflow
 
@@ -190,3 +250,4 @@ When `dev` is stable:
 
 - Alembic usage is documented above; initialize it when you are ready to start versioning schema changes.
 - Pin dependency versions in requirements.txt for reproducible builds.
+- In development, do not run the API container; run API from local venv only.
