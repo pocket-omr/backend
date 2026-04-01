@@ -7,6 +7,51 @@
 - PostgreSQL 16 (alpine)
 - MinIO (S3-compatible object storage)
 
+## Project structure
+
+```text
+app/
+   api/v1/endpoints/   # route modules
+   core/               # settings and shared core config
+   db/                 # DB engine/session primitives
+   models/             # SQLAlchemy models
+   schemas/            # Pydantic schemas
+   services/           # business logic layer
+   main.py             # FastAPI app entrypoint
+tests/
+   test_health.py      # smoke tests
+```
+
+## App File Tree Explained
+
+This backend follows a layered structure so each concern stays in one place.
+
+- `app/main.py`: FastAPI application entrypoint. Creates the app instance and mounts versioned routers.
+- `app/api/`: HTTP layer only.
+- `app/api/v1/router.py`: Aggregates v1 endpoint routers under `/api/v1`.
+- `app/api/v1/endpoints/`: Route handlers grouped by domain (for example `health.py`, `auth.py`).
+- `app/core/`: Application-wide settings and security helpers.
+- `app/db/`: Database session and engine setup (`get_db` dependency lives here).
+- `app/models/`: SQLAlchemy ORM models and enums (database shape).
+- `app/schemas/`: Pydantic request/response models (API contracts).
+- `app/services/`: Business logic used by endpoints; keeps route handlers thin.
+- `tests/`: API and unit tests.
+
+Typical request flow:
+
+1. Endpoint in `app/api/v1/endpoints/*` receives request.
+2. Endpoint validates payload via `app/schemas/*`.
+3. Endpoint calls business logic in `app/services/*`.
+4. Service reads/writes `app/models/*` using session from `app/db/session.py`.
+5. Endpoint returns schema response from `app/schemas/*`.
+
+Where to add new code:
+
+- New endpoint: `app/api/v1/endpoints/`
+- New service/business logic: `app/services/`
+- New ORM model: `app/models/`
+- New request/response schema: `app/schemas/`
+
 ## Services and ports
 
 - Dev API (venv): `http://localhost:8000`
@@ -163,7 +208,10 @@ For verbose output:
 pytest -v
 ```
 
-Consider making a `/tests` directory to organize your test suite.
+Run only smoke tests:
+```bash
+pytest tests/test_health.py -v
+```
 
 ## Database Migrations (Alembic)
 
