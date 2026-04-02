@@ -156,3 +156,74 @@ def test_logout_missing_authorization_header(client: TestClient) -> None:
     )
 
     assert response.status_code == 401
+
+
+def test_refresh_token_rotation(client: TestClient) -> None:
+    registered = register_user(client, unique_email("rotation"))
+    old_refresh = registered["refresh_token"]
+
+    client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})
+
+    # old token should now be rejected
+    response = client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert response.status_code == 401
+
+
+def test_refresh_after_logout_fails(client: TestClient) -> None:
+    registered = register_user(client, unique_email("refresh_after_logout"))
+    access_token = registered["access_token"]
+    refresh_token = registered["refresh_token"]
+
+    client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh_token},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    response = client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert response.status_code == 401
+
+
+def test_me_after_logout_fails(client: TestClient) -> None:
+    registered = register_user(client, unique_email("me_after_logout"))
+    access_token = registered["access_token"]
+    refresh_token = registered["refresh_token"]
+
+    client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh_token},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    response = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == 401
+
+
+def test_register_weak_password(client: TestClient) -> None:
+    for bad_password in ["short1A", "alllowercase1", "NOLOWER1", "NoDigits"]:
+        response = client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": unique_email("weak"),
+                "password": bad_password,
+                "first_name": "Weak",
+                "last_name": "Pass",
+            },
+        )
+        assert response.status_code == 422
+
+
+def test_register_invalid_email(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "not-an-email",
+            "password": "Password1",
+            "first_name": "Bad",
+            "last_name": "Email",
+        },
+    )
+    assert response.status_code == 422
