@@ -50,7 +50,8 @@ class AuthService:
         user = User(
             email=email,
             hashed_password=hash_password(payload.password),
-            full_name=payload.full_name.strip(),
+            first_name=payload.first_name.strip(),
+            last_name=payload.last_name.strip(),
             role=UserRole.TEACHER,
             is_active=True,
         )

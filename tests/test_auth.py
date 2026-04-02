@@ -14,7 +14,8 @@ def register_user(client: TestClient, email: str | None = None) -> dict[str, obj
         json={
             "email": email,
             "password": "Password1",
-            "full_name": "Teacher One",
+            "first_name": "Teacher One",
+            "last_name": "Teacher One",
         },
     )
     assert response.status_code == 201
@@ -28,7 +29,8 @@ def test_register_success(client: TestClient) -> None:
         json={
             "email": email,
             "password": "Password1",
-            "full_name": "Register OK",
+            "first_name": "Register",
+            "last_name": "OK",
         },
     )
 
@@ -46,7 +48,8 @@ def test_register_duplicate_email(client: TestClient) -> None:
     payload = {
         "email": email,
         "password": "Password1",
-        "full_name": "Dup User",
+        "first_name": "Dup",
+        "last_name": "User",
     }
     first = client.post("/api/v1/auth/register", json=payload)
     assert first.status_code == 201
