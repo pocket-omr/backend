@@ -3,24 +3,32 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import EmailStr, Field, field_validator
 
+from app.core.security import validate_password_strength
 from app.schemas.base import APIModel
 
 
 class RegisterRequest(APIModel):
     """Payload for account registration."""
 
-    email: str = Field(min_length=3, max_length=255)
+    email: EmailStr = Field(max_length=255)
     password: str = Field(min_length=8, max_length=128)
     first_name: str = Field(min_length=1, max_length=255)
     last_name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("password")
+    @classmethod
+    def check_password_strength(cls, v: str) -> str:
+        """Validate password meets strength requirements."""
+        validate_password_strength(v)
+        return v
 
 
 class LoginRequest(APIModel):
     """Payload for user login."""
 
-    email: str = Field(min_length=3, max_length=255)
+    email: EmailStr = Field(max_length=255)
     password: str = Field(min_length=1, max_length=128)
 
 
@@ -62,4 +70,5 @@ class RefreshResponse(APIModel):
     """Token response for refresh endpoint."""
 
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"

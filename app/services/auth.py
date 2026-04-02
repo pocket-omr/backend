@@ -40,7 +40,12 @@ class AuthService:
     async def register(db: AsyncSession, payload: RegisterRequest) -> TokenResponse:
         """Create user (teacher role only) and issue access/refresh tokens."""
         email = payload.email.strip().lower()
-        validate_password_strength(payload.password)
+
+        # Validate password strength (defensive check - schema already validates)
+        try:
+            validate_password_strength(payload.password)
+        except ValueError as exc:
+            raise AuthServiceError(str(exc)) from exc
 
         existing_stmt = select(User).where(func.lower(User.email) == email)
         existing = (await db.execute(existing_stmt)).scalar_one_or_none()
@@ -112,7 +117,7 @@ class AuthService:
 
     @staticmethod
     async def refresh(db: AsyncSession, payload: RefreshRequest) -> RefreshResponse:
-        """Issue a new access token from a valid stored refresh token."""
+        """Issue new tokens from a valid stored refresh token (token rotation)."""
         claims = AuthService._decode_and_validate_token(payload.refresh_token, token_type="refresh")
 
         token_hash_value = hash_token(payload.refresh_token)
@@ -127,8 +132,17 @@ class AuthService:
             raise AuthServiceError("Refresh token has expired")
 
         user = await AuthService._get_active_user_from_sub(db, claims["sub"])
+
+        # Token rotation: delete old token and issue new one
+        await db.execute(delete(RefreshToken).where(RefreshToken.id == refresh_row.id))
+
         access_token = create_access_token(subject=str(user.id), email=user.email)
-        return RefreshResponse(access_token=access_token)
+        new_refresh_token = create_refresh_token(subject=str(user.id), email=user.email)
+        await AuthService._store_refresh_token(db, user.id, new_refresh_token)
+
+        await db.commit()
+
+        return RefreshResponse(access_token=access_token, refresh_token=new_refresh_token)
 
     @staticmethod
     async def logout(db: AsyncSession, access_token: str, payload: LogoutRequest) -> None:
