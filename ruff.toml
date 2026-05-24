@@ -1,0 +1,5 @@
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "UP", "B", "A", "C4", "PIE", "SIM", "RUF"]
+ignore = ["B008"]  # Depends() in defaults is standard FastAPI pattern
