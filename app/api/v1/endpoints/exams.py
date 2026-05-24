@@ -120,10 +120,20 @@ async def upload_images(
     files: list[UploadFile] = File(...),
     deps: tuple = Depends(_get_current_user_id),
 ):
-    """Upload scanned sheet images for an exam. ML processing is not yet implemented."""
+    """Upload scanned sheets (images or a .zip of images); each is stored and graded."""
     user_id, db = deps
-    file_names = [f.filename or "unknown" for f in files]
+    payload = [(f.filename or "upload", await f.read()) for f in files]
     try:
-        return await ExamService.upload_images(db, exam_id, user_id, file_names)
+        return await ExamService.upload_images(db, exam_id, user_id, payload)
+    except ServiceError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.post("/{exam_id}/regrade", response_model=MobileExamOut)
+async def regrade(exam_id: uuid.UUID, deps: tuple = Depends(_get_current_user_id)):
+    """Re-run grading on all pending submissions (e.g. after the OMR model is wired in)."""
+    user_id, db = deps
+    try:
+        return await ExamService.regrade_pending(db, exam_id, user_id)
     except ServiceError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e

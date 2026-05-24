@@ -15,6 +15,23 @@ services:
       timeout: 3s
       retries: 5
 
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   api:
     build: .
     ports:
@@ -23,9 +40,13 @@ services:
     environment:
       POSTGRES_HOST: pgsql
       POSTGRES_PORT: 5432
+      MINIO_ENDPOINT: minio:9000
     depends_on:
       pgsql:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
 volumes:
   pgdata_v2:
+  minio_data:

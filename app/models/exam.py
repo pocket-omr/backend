@@ -127,6 +127,7 @@ class StudentSubmission(Base):
     score: Mapped[int] = mapped_column(Integer, default=0)
     max_score: Mapped[int] = mapped_column(Integer, default=0)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
     sheet_image_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     recognized_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

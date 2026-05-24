@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     smtp_email: str = ""
     smtp_password: str = ""
 
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_bucket: str = "omr-sheets"
+    minio_secure: bool = False
+
     @property
     def database_url(self) -> str:
         from urllib.parse import quote_plus

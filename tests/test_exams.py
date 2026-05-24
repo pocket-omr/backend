@@ -1,5 +1,11 @@
+import io
+import zipfile
+
 import pytest
 
+from app.services import exam as exam_service
+from app.services import storage
+from app.services.grading import GradingResult
 from tests.conftest import register_user
 
 
@@ -189,3 +195,129 @@ async def test_get_exam_mobile(client):
     assert data["id"] == exam_id
     assert data["title"] == "Final Exam 2026"
     assert "totalStudents" in data
+
+
+# --- Upload / grading pipeline ---
+
+
+@pytest.fixture
+def fake_storage(monkeypatch):
+    """Replace MinIO with an in-memory object store so tests don't need a live bucket."""
+    store: dict[str, bytes] = {}
+
+    async def _put(key, data, content_type="application/octet-stream"):
+        store[key] = data
+        return key
+
+    async def _get(key):
+        return store[key]
+
+    monkeypatch.setattr(storage, "put_object", _put)
+    monkeypatch.setattr(storage, "get_object", _get)
+    return store
+
+
+async def _create_exam(client, headers) -> str:
+    resp = await client.post("/api/v1/exams", json=SAMPLE_EXAM, headers=headers)
+    return resp.json()["id"]
+
+
+def _zip_of(images: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in images.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_upload_images_pending(client, fake_storage):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    files = [
+        ("files", ("sheet1.jpg", b"fakejpeg1", "image/jpeg")),
+        ("files", ("sheet2.jpg", b"fakejpeg2", "image/jpeg")),
+    ]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Two sheets stored, none graded yet (model not wired in)
+    assert data["totalStudents"] == 2
+    assert data["correctedCount"] == 0
+    assert len(data["students"]) == 2
+    assert all(s["score"] == 0 for s in data["students"])
+    assert len(fake_storage) == 2
+
+    hist = (await client.get("/api/v1/exams/history", headers=headers)).json()
+    row = next(e for e in hist if e["id"] == exam_id)
+    assert row["totalPages"] == 2
+    assert row["pendingPages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_upload_zip(client, fake_storage):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    archive = _zip_of({"a.png": b"img-a", "b.png": b"img-b", "notes.txt": b"ignore me"})
+    files = [("files", ("scans.zip", archive, "application/zip"))]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.status_code == 200
+    # Only the two images count; the .txt member is ignored
+    assert resp.json()["totalStudents"] == 2
+    assert len(fake_storage) == 2
+
+
+@pytest.mark.asyncio
+async def test_upload_and_grade(client, fake_storage, monkeypatch):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    # Answer key in SAMPLE_EXAM is [1, 1]; this sheet gets both right.
+    def fake_grade(image_bytes, exam):
+        return GradingResult(answers=[1, 1], confidence=95.0, first_name="Ada", last_name="Lovelace")
+
+    monkeypatch.setattr(exam_service, "grade_sheet", fake_grade)
+
+    files = [("files", ("s.jpg", b"img", "image/jpeg"))]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["totalStudents"] == 1
+    assert data["correctedCount"] == 1
+    assert data["avgConfidence"] == 95.0
+    student = data["students"][0]
+    assert student["score"] == 2
+    assert student["maxScore"] == 2
+    assert student["firstName"] == "Ada"
+
+
+@pytest.mark.asyncio
+async def test_regrade_pending(client, fake_storage, monkeypatch):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    # First upload while the model is unavailable -> pending
+    files = [("files", ("s.jpg", b"img", "image/jpeg"))]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.json()["correctedCount"] == 0
+
+    # Model lands; re-grade the pending sheet
+    monkeypatch.setattr(
+        exam_service, "grade_sheet", lambda b, e: GradingResult(answers=[1, 0], confidence=80.0)
+    )
+    resp = await client.post(f"/api/v1/exams/{exam_id}/regrade", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["correctedCount"] == 1
+    assert data["students"][0]["score"] == 1  # one of two correct
+    assert data["students"][0]["maxScore"] == 2

@@ -1,11 +1,20 @@
+import io
 import uuid
+import zipfile
 from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.exam import Choice, Exam, ExamStatus, ExamStudent, Question
+from app.models.exam import (
+    Choice,
+    Exam,
+    ExamStatus,
+    ExamStudent,
+    Question,
+    StudentSubmission,
+)
 from app.schemas.exam import (
     ChoiceOut,
     ExamCreate,
@@ -17,7 +26,50 @@ from app.schemas.exam import (
     QuestionOut,
     StudentResultOut,
 )
+from app.services import storage
 from app.services.base import ServiceError
+from app.services.grading import GradingNotAvailable, GradingResult, grade_sheet
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+
+def _is_image(name: str) -> bool:
+    return any(name.lower().endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def _content_type(name: str) -> str:
+    for ext, ct in _CONTENT_TYPES.items():
+        if name.lower().endswith(ext):
+            return ct
+    return "application/octet-stream"
+
+
+def _extract_images(files: list[tuple[str, bytes]]) -> list[tuple[str, bytes]]:
+    """Flatten uploaded files into (filename, bytes) image pairs.
+
+    Each upload may be a single image or a .zip archive of images; zips are
+    expanded and their non-image members ignored.
+    """
+    images: list[tuple[str, bytes]] = []
+    for filename, content in files:
+        if filename.lower().endswith(".zip") or zipfile.is_zipfile(io.BytesIO(content)):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                for member in zf.namelist():
+                    if member.endswith("/") or not _is_image(member):
+                        continue
+                    images.append((member.rsplit("/", 1)[-1], zf.read(member)))
+        elif _is_image(filename):
+            images.append((filename, content))
+    return images
 
 
 def _parse_date(d: str) -> date | None:
@@ -265,26 +317,144 @@ class ExamService:
 
     @staticmethod
     async def upload_images(
-        db: AsyncSession, exam_id: uuid.UUID, user_id: uuid.UUID, file_paths: list[str]
+        db: AsyncSession,
+        exam_id: uuid.UUID,
+        user_id: uuid.UUID,
+        files: list[tuple[str, bytes]],
     ) -> MobileExamOut:
-        """Stub for image upload. Stores file paths; actual ML processing is not yet implemented."""
+        """Store scanned sheets and grade each one.
+
+        Each item in `files` is a (filename, bytes) pair and may be a single
+        image or a .zip of images. Every image is stored in MinIO and recorded
+        as a StudentSubmission. If the grading model isn't wired in yet, the
+        submission is left PENDING and can be graded later via regrade_pending.
+        """
+        exam = await ExamService._load_for_grading(db, exam_id, user_id)
+
+        images = _extract_images(files)
+        for filename, content in images:
+            key = storage.build_key(exam.id, filename)
+            await storage.put_object(key, content, _content_type(filename))
+
+            submission = StudentSubmission(sheet_image_path=key)
+            _apply_grading(submission, content, exam)
+            exam.submissions.append(submission)
+
+        _recompute_aggregates(exam)
+        await db.commit()
+
+        return await ExamService.get_mobile(db, exam_id, user_id)
+
+    @staticmethod
+    async def regrade_pending(
+        db: AsyncSession, exam_id: uuid.UUID, user_id: uuid.UUID
+    ) -> MobileExamOut:
+        """Re-run grading on every PENDING submission (e.g. after the model lands)."""
+        exam = await ExamService._load_for_grading(db, exam_id, user_id)
+
+        for submission in exam.submissions:
+            if submission.status != "pending":
+                continue
+            if not submission.sheet_image_path:
+                continue
+            content = await storage.get_object(submission.sheet_image_path)
+            _apply_grading(submission, content, exam)
+
+        _recompute_aggregates(exam)
+        await db.commit()
+        return await ExamService.get_mobile(db, exam_id, user_id)
+
+    @staticmethod
+    async def _load_for_grading(
+        db: AsyncSession, exam_id: uuid.UUID, user_id: uuid.UUID
+    ) -> Exam:
         result = await db.execute(
             select(Exam)
-            .options(selectinload(Exam.submissions))
+            .options(
+                selectinload(Exam.submissions),
+                selectinload(Exam.questions),
+            )
             .where(Exam.id == exam_id, Exam.user_id == user_id)
         )
         exam = result.scalar_one_or_none()
         if not exam:
             raise ServiceError("Exam not found")
+        return exam
 
-        exam.total_pages += len(file_paths)
-        exam.pending_pages += len(file_paths)
-        if exam.status == ExamStatus.draft:
-            exam.status = ExamStatus.ready
 
-        await db.commit()
-        await db.refresh(exam)
-        return _exam_to_mobile(exam)
+def _answer_key(exam: Exam) -> list[int | None]:
+    """Correct choice index per question, ordered by Question.order_index."""
+    return [q.correct_answer for q in exam.questions]
+
+
+def _derive_score(result: GradingResult, exam: Exam) -> tuple[int, int]:
+    """Score a result from its detected answers vs the answer key.
+
+    Used only when the model didn't return its own score/max_score. Each
+    question with a defined correct answer is worth one point.
+    """
+    key = _answer_key(exam)
+    gradeable = [k for k in key if k is not None]
+    max_score = len(gradeable)
+    score = sum(
+        1
+        for i, correct in enumerate(key)
+        if correct is not None
+        and i < len(result.answers)
+        and result.answers[i] == correct
+    )
+    return score, max_score
+
+
+def _apply_grading(submission: StudentSubmission, image: bytes, exam: Exam) -> None:
+    """Run the grading model on one sheet and write results onto the submission.
+
+    Falls back to a PENDING submission if the model isn't wired in yet.
+    """
+    try:
+        result = grade_sheet(image, exam)
+    except GradingNotAvailable:
+        submission.status = "pending"
+        submission.score = 0
+        submission.max_score = len([q for q in exam.questions if q.correct_answer is not None])
+        submission.confidence = 0.0
+        return
+
+    score, max_score = result.score, result.max_score
+    if max_score == 0:
+        score, max_score = _derive_score(result, exam)
+
+    submission.status = "graded"
+    submission.score = score
+    submission.max_score = max_score
+    submission.confidence = result.confidence
+    submission.first_name = result.first_name
+    submission.last_name = result.last_name
+    submission.student_id = result.student_id
+    if result.first_name or result.last_name:
+        submission.recognized_name = f"{result.first_name} {result.last_name}".strip()
+
+
+def _recompute_aggregates(exam: Exam) -> None:
+    """Refresh denormalized exam stats from its current submissions."""
+    subs = exam.submissions
+    graded = [s for s in subs if s.status == "graded"]
+    pending = [s for s in subs if s.status == "pending"]
+
+    exam.total_students = len(subs)
+    exam.corrected_count = len(graded)
+    exam.total_pages = len(subs)
+    exam.pending_pages = len(pending)
+    exam.avg_confidence = (
+        round(sum(s.confidence for s in graded) / len(graded), 1) if graded else 0.0
+    )
+
+    if not subs:
+        return
+    if pending:
+        exam.status = ExamStatus.in_progress
+    else:
+        exam.status = ExamStatus.completed
 
 
 def _exam_to_mobile(exam: Exam) -> MobileExamOut:
