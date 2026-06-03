@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -72,7 +72,12 @@ class Question(Base):
     )
     order_index: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text, default="")
+    # Legacy single correct choice (kept = first of correct_answers, for back-compat).
     correct_answer: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Correct choice indices (0-based). Supports multiple-correct questions.
+    correct_answers: Mapped[list] = mapped_column(JSON, default=list)
+    # Points awarded for answering this question correctly (teacher-set).
+    points: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
@@ -106,7 +111,11 @@ class ExamStudent(Base):
     exam_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("exams.id", ondelete="CASCADE"), index=True
     )
-    name: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(255), default="")
+    first_name: Mapped[str] = mapped_column(String(255), default="")
+    last_name: Mapped[str] = mapped_column(String(255), default="")
+    group_name: Mapped[str] = mapped_column(String(255), default="")
+    registration_number: Mapped[str] = mapped_column(String(100), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
@@ -128,6 +137,10 @@ class StudentSubmission(Base):
     max_score: Mapped[int] = mapped_column(Integer, default=0)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    # Set when the grader was unsure of one or more answers (human review).
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 1-based question numbers the grader flagged as uncertain.
+    flagged_questions: Mapped[list] = mapped_column(JSON, default=list)
     sheet_image_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     recognized_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -13,7 +13,16 @@ class ChoiceIn(APIModel):
 class QuestionIn(APIModel):
     text: str = ""
     choices: list[ChoiceIn] = Field(default_factory=list)
-    correct: int | None = None
+    # Correct choice indices (0-based). Multiple => multiple-correct question.
+    correct: list[int] = Field(default_factory=list)
+    points: int = 1
+
+
+class StudentIn(APIModel):
+    firstName: str = ""
+    lastName: str = ""
+    group: str = ""
+    registrationNumber: str = ""
 
 
 class ExamCreate(APIModel):
@@ -21,7 +30,7 @@ class ExamCreate(APIModel):
     questions: list[QuestionIn] = Field(default_factory=list)
     checkbox_type: str = Field(default="Fill", alias="checkboxType")
     grid_layout: str = Field(default="Linear", alias="gridLayout")
-    students: list[str] = Field(default_factory=list)
+    students: list[StudentIn] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True
@@ -58,7 +67,8 @@ class QuestionOut(APIModel):
     id: uuid.UUID
     text: str
     choices: list[ChoiceOut]
-    correct: int | None
+    correct: list[int] = Field(default_factory=list)
+    points: int = 1
 
 
 class ExamFormOut(APIModel):
@@ -74,13 +84,20 @@ class ExamFormOut(APIModel):
     instructions: str
 
 
+class StudentOut(APIModel):
+    firstName: str
+    lastName: str
+    group: str
+    registrationNumber: str
+
+
 class ExamOut(APIModel):
     id: uuid.UUID
     form: ExamFormOut
     questions: list[QuestionOut]
     checkboxType: str
     gridLayout: str
-    students: list[str]
+    students: list[StudentOut]
     createdAt: datetime
     updatedAt: datetime
 
@@ -95,6 +112,15 @@ class StudentResultOut(APIModel):
     score: int
     maxScore: int
     confidence: float
+    # True when the grader was unsure of one or more answers (human review).
+    needsReview: bool = False
+    # 1-based question numbers flagged as uncertain.
+    flaggedQuestions: list[int] = Field(default_factory=list)
+
+
+class FailedSheetOut(APIModel):
+    filename: str
+    reason: str
 
 
 class MobileExamOut(APIModel):
@@ -104,6 +130,8 @@ class MobileExamOut(APIModel):
     correctedCount: int
     avgConfidence: float
     students: list[StudentResultOut]
+    # Sheets that couldn't be segmented on this upload (not stored/graded).
+    failedSheets: list[FailedSheetOut] = Field(default_factory=list)
 
 
 class HistoryExamOut(APIModel):

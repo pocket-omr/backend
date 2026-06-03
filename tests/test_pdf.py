@@ -19,12 +19,12 @@ SAMPLE_PDF_REQUEST = {
         {
             "text": "Q1?",
             "choices": [{"text": "A"}, {"text": "B"}, {"text": "C"}, {"text": "D"}],
-            "correct": 0,
+            "correct": [0],
         },
         {
             "text": "Q2?",
             "choices": [{"text": "A"}, {"text": "B"}, {"text": "C"}, {"text": "D"}],
-            "correct": 1,
+            "correct": [1],
         },
     ],
     "checkboxType": "Fill",

@@ -514,12 +514,15 @@ def generate_correction_sheet(req: PDFRequest) -> bytes:
             c_pdf.setFillColor(DARK)
             c_pdf.drawString(table_x + 8, row_y + 6, f"Q{gi + 1}")
 
+            # Correct choice indices (supports multiple correct answers).
+            correct = {c for c in (q.correct or []) if c < len(q.choices)}
+
             # Choice indicators
             for ci in range(max_choices):
                 cx = table_x + q_col_w + ci * choice_col_w + choice_col_w / 2
                 cy = row_y + row_h / 2
                 if ci < len(q.choices):
-                    if q.correct == ci:
+                    if ci in correct:
                         c_pdf.setFillColor(colors.HexColor("#0FE2A6"))
                         c_pdf.circle(cx, cy, 7, fill=1, stroke=0)
                         c_pdf.setFillColor(colors.white)
@@ -530,11 +533,8 @@ def generate_correction_sheet(req: PDFRequest) -> bytes:
                         c_pdf.setLineWidth(0.5)
                         c_pdf.circle(cx, cy, 7, fill=0, stroke=1)
 
-            # Answer label
-            has_answer = (
-                q.correct is not None and q.correct < len(q.choices)
-            )
-            answer = CHOICE_LABELS[q.correct] if has_answer else "-"
+            # Answer label (comma-separated for multiple correct answers)
+            answer = ", ".join(CHOICE_LABELS[c] for c in sorted(correct)) if correct else "-"
             c_pdf.setFont("Helvetica-Bold", 9)
             c_pdf.setFillColor(DARK)
             ans_x = (

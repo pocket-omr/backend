@@ -1,6 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -127,6 +128,23 @@ async def upload_images(
         return await ExamService.upload_images(db, exam_id, user_id, payload)
     except ServiceError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.get("/{exam_id}/results.xlsx")
+async def export_results(exam_id: uuid.UUID, deps: tuple = Depends(_get_current_user_id)):
+    """Download the exam's graded students as an Excel list (name, group,
+    registration number, score, percentage)."""
+    user_id, db = deps
+    try:
+        data, title = await ExamService.export_results_xlsx(db, exam_id, user_id)
+    except ServiceError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    safe = "".join(c for c in (title or "exam") if c.isalnum() or c in " -_") or "exam"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{safe}_grades.xlsx"'},
+    )
 
 
 @router.post("/{exam_id}/regrade", response_model=MobileExamOut)

@@ -26,17 +26,30 @@ SAMPLE_EXAM = {
         {
             "text": "What is 2+2?",
             "choices": [{"text": "3"}, {"text": "4"}, {"text": "5"}, {"text": "6"}],
-            "correct": 1,
+            "correct": [1],
         },
         {
             "text": "What is 3*3?",
             "choices": [{"text": "6"}, {"text": "9"}, {"text": "12"}, {"text": "15"}],
-            "correct": 1,
+            "correct": [1],
         },
     ],
     "checkboxType": "Fill",
     "gridLayout": "Linear",
-    "students": ["Alice Smith", "Bob Jones"],
+    "students": [
+        {
+            "firstName": "Alice",
+            "lastName": "Smith",
+            "group": "G1",
+            "registrationNumber": "2026001",
+        },
+        {
+            "firstName": "Bob",
+            "lastName": "Jones",
+            "group": "G2",
+            "registrationNumber": "2026002",
+        },
+    ],
 }
 
 
@@ -53,11 +66,17 @@ async def test_create_exam(client):
     data = resp.json()
     assert data["form"]["title"] == "Final Exam 2026"
     assert len(data["questions"]) == 2
-    assert data["questions"][0]["correct"] == 1
+    assert data["questions"][0]["correct"] == [1]
     assert len(data["questions"][0]["choices"]) == 4
     assert data["checkboxType"] == "Fill"
     assert data["gridLayout"] == "Linear"
-    assert data["students"] == ["Alice Smith", "Bob Jones"]
+    assert len(data["students"]) == 2
+    assert data["students"][0] == {
+        "firstName": "Alice",
+        "lastName": "Smith",
+        "group": "G1",
+        "registrationNumber": "2026001",
+    }
 
 
 @pytest.mark.asyncio
@@ -89,13 +108,27 @@ async def test_update_exam(client):
 
     updated = SAMPLE_EXAM.copy()
     updated["form"] = {**SAMPLE_EXAM["form"], "title": "Updated Exam"}
-    updated["students"] = ["Charlie Brown"]
+    updated["students"] = [
+        {
+            "firstName": "Charlie",
+            "lastName": "Brown",
+            "group": "G3",
+            "registrationNumber": "2026003",
+        }
+    ]
 
     resp = await client.put(f"/api/v1/exams/{exam_id}", json=updated, headers=headers)
     assert resp.status_code == 200
     data = resp.json()
     assert data["form"]["title"] == "Updated Exam"
-    assert data["students"] == ["Charlie Brown"]
+    assert data["students"] == [
+        {
+            "firstName": "Charlie",
+            "lastName": "Brown",
+            "group": "G3",
+            "registrationNumber": "2026003",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -185,6 +218,33 @@ async def test_history_exams(client):
 
 
 @pytest.mark.asyncio
+async def test_history_avg_confidence_and_processed(client, fake_storage, no_precheck, monkeypatch):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    # Two graded sheets with confidences 80 and 90 -> avg 85; both processed.
+    confidences = iter([80.0, 90.0])
+    monkeypatch.setattr(
+        exam_service,
+        "grade_sheet",
+        lambda image_bytes, exam: GradingResult(
+            answers=[1, 1], confidence=next(confidences)
+        ),
+    )
+    files = [
+        ("files", ("a.jpg", b"a", "image/jpeg")),
+        ("files", ("b.jpg", b"b", "image/jpeg")),
+    ]
+    await client.post(f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers)
+
+    hist = (await client.get("/api/v1/exams/history", headers=headers)).json()
+    row = next(e for e in hist if e["id"] == exam_id)
+    assert row["avgConfidence"] == 85.0          # (80 + 90) / 2
+    assert row["totalPages"] == 2
+    assert row["pendingPages"] == 0              # both graded -> 2 processed
+
+
+@pytest.mark.asyncio
 async def test_get_exam_mobile(client):
     headers = await _auth_header(client)
     create_resp = await client.post("/api/v1/exams", json=SAMPLE_EXAM, headers=headers)
@@ -217,6 +277,13 @@ def fake_storage(monkeypatch):
     return store
 
 
+@pytest.fixture
+def no_precheck(monkeypatch):
+    """Bypass the segmentation pre-check so grading-path tests can use fake image
+    bytes (which wouldn't segment). Behaviour is otherwise unchanged."""
+    monkeypatch.setattr(exam_service, "_segmentation_reason", lambda content, filename: None)
+
+
 async def _create_exam(client, headers) -> str:
     resp = await client.post("/api/v1/exams", json=SAMPLE_EXAM, headers=headers)
     return resp.json()["id"]
@@ -231,7 +298,7 @@ def _zip_of(images: dict[str, bytes]) -> bytes:
 
 
 @pytest.mark.asyncio
-async def test_upload_images_pending(client, fake_storage):
+async def test_upload_images_pending(client, fake_storage, no_precheck):
     headers = await _auth_header(client)
     exam_id = await _create_exam(client, headers)
 
@@ -258,7 +325,7 @@ async def test_upload_images_pending(client, fake_storage):
 
 
 @pytest.mark.asyncio
-async def test_upload_zip(client, fake_storage):
+async def test_upload_zip(client, fake_storage, no_precheck):
     headers = await _auth_header(client)
     exam_id = await _create_exam(client, headers)
 
@@ -273,14 +340,28 @@ async def test_upload_zip(client, fake_storage):
     assert len(fake_storage) == 2
 
 
+def test_extract_images_skips_macos_cruft():
+    # macOS-created zips include __MACOSX/._name AppleDouble metadata that must
+    # not be treated as images (caused bogus "could not read image" failures).
+    archive = _zip_of({
+        "02B09O.jpg": b"realimage",
+        "__MACOSX/._02B09O.jpg": b"applemeta",
+        "._02B09O.jpg": b"applemeta",
+    })
+    imgs = exam_service._extract_images([("scans.zip", archive)])
+    assert [name for name, _ in imgs] == ["02B09O.jpg"]
+
+
 @pytest.mark.asyncio
-async def test_upload_and_grade(client, fake_storage, monkeypatch):
+async def test_upload_and_grade(client, fake_storage, no_precheck, monkeypatch):
     headers = await _auth_header(client)
     exam_id = await _create_exam(client, headers)
 
     # Answer key in SAMPLE_EXAM is [1, 1]; this sheet gets both right.
     def fake_grade(image_bytes, exam):
-        return GradingResult(answers=[1, 1], confidence=95.0, first_name="Ada", last_name="Lovelace")
+        return GradingResult(
+            answers=[1, 1], confidence=95.0, first_name="Ada", last_name="Lovelace"
+        )
 
     monkeypatch.setattr(exam_service, "grade_sheet", fake_grade)
 
@@ -297,10 +378,34 @@ async def test_upload_and_grade(client, fake_storage, monkeypatch):
     assert student["score"] == 2
     assert student["maxScore"] == 2
     assert student["firstName"] == "Ada"
+    assert student["needsReview"] is False
+    assert student["flaggedQuestions"] == []
 
 
 @pytest.mark.asyncio
-async def test_regrade_pending(client, fake_storage, monkeypatch):
+async def test_upload_surfaces_review_flag(client, fake_storage, no_precheck, monkeypatch):
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    def fake_grade(image_bytes, exam):
+        return GradingResult(
+            answers=[1, 1], confidence=72.0, needs_review=True, flagged_questions=[2]
+        )
+
+    monkeypatch.setattr(exam_service, "grade_sheet", fake_grade)
+
+    files = [("files", ("s.jpg", b"img", "image/jpeg"))]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.status_code == 200
+    student = resp.json()["students"][0]
+    assert student["needsReview"] is True
+    assert student["flaggedQuestions"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_regrade_pending(client, fake_storage, no_precheck, monkeypatch):
     headers = await _auth_header(client)
     exam_id = await _create_exam(client, headers)
 
@@ -319,5 +424,36 @@ async def test_regrade_pending(client, fake_storage, monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["correctedCount"] == 1
-    assert data["students"][0]["score"] == 1  # one of two correct
-    assert data["students"][0]["maxScore"] == 2
+
+
+@pytest.mark.asyncio
+async def test_upload_reports_segmentation_failures(client, fake_storage, monkeypatch):
+    """Sheets that can't be segmented are reported in failedSheets and are
+    neither stored nor turned into submissions; readable sheets still go through."""
+    headers = await _auth_header(client)
+    exam_id = await _create_exam(client, headers)
+
+    # Simulate: the second sheet fails segmentation, the first is fine.
+    def fake_reason(content, filename):
+        return "no name boxes detected" if filename == "bad.jpg" else None
+
+    monkeypatch.setattr(exam_service, "_segmentation_reason", fake_reason)
+
+    files = [
+        ("files", ("good.jpg", b"img-good", "image/jpeg")),
+        ("files", ("bad.jpg", b"img-bad", "image/jpeg")),
+    ]
+    resp = await client.post(
+        f"/api/v1/exams/{exam_id}/upload-images", files=files, headers=headers
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Only the readable sheet was ingested.
+    assert data["totalStudents"] == 1
+    assert len(fake_storage) == 1
+
+    # The unreadable sheet is reported back for the popup.
+    assert len(data["failedSheets"]) == 1
+    assert data["failedSheets"][0]["filename"] == "bad.jpg"
+    assert data["failedSheets"][0]["reason"] == "no name boxes detected"

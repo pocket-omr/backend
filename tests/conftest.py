@@ -37,7 +37,9 @@ async def register_user(client: AsyncClient, email: str | None = None) -> dict:
 
 @pytest_asyncio.fixture
 async def db_session():
-    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    # IMPORTANT: use the dedicated test database, never the dev DB — this fixture
+    # deletes all rows after each test (see cleanup below).
+    engine = create_async_engine(TEST_DB_URL, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with engine.begin() as conn:

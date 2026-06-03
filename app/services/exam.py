@@ -21,11 +21,14 @@ from app.schemas.exam import (
     ExamFormOut,
     ExamOut,
     ExamUpdate,
+    FailedSheetOut,
     HistoryExamOut,
     MobileExamOut,
     QuestionOut,
+    StudentOut,
     StudentResultOut,
 )
+from app.core.config import settings
 from app.services import storage
 from app.services.base import ServiceError
 from app.services.grading import GradingNotAvailable, GradingResult, grade_sheet
@@ -66,10 +69,45 @@ def _extract_images(files: list[tuple[str, bytes]]) -> list[tuple[str, bytes]]:
                 for member in zf.namelist():
                     if member.endswith("/") or not _is_image(member):
                         continue
-                    images.append((member.rsplit("/", 1)[-1], zf.read(member)))
+                    base = member.rsplit("/", 1)[-1]
+                    # Skip macOS zip cruft: __MACOSX/ entries and AppleDouble
+                    # "._name" resource-fork files (not real images).
+                    if "__MACOSX" in member or base.startswith("._"):
+                        continue
+                    images.append((base, zf.read(member)))
         elif _is_image(filename):
             images.append((filename, content))
     return images
+
+
+def _segmentation_reason(content: bytes, filename: str) -> str | None:
+    """Why a sheet failed segmentation, or None. Skips the check (returns None)
+    if the OpenCV recognition deps aren't installed in this environment."""
+    try:
+        from app.recognition.segmentation_check import segmentation_failure_reason
+    except Exception:  # recognition deps unavailable -> don't block uploads
+        return None
+    try:
+        return segmentation_failure_reason(content, filename)
+    except Exception:
+        # Never let the check itself fail an upload; treat as "couldn't read".
+        return "could not process image"
+
+
+def _build_student(exam_id: uuid.UUID, s) -> ExamStudent:
+    """Build an ExamStudent from an incoming StudentIn record.
+
+    `name` is kept as the joined full name for backward compatibility with
+    consumers that still read the single-name column.
+    """
+    return ExamStudent(
+        exam_id=exam_id,
+        first_name=s.firstName,
+        last_name=s.lastName,
+        group_name=s.group,
+        registration_number=s.registrationNumber,
+        name=f"{s.firstName} {s.lastName}".strip(),
+    )
 
 
 def _parse_date(d: str) -> date | None:
@@ -86,7 +124,13 @@ def _exam_to_response(exam: Exam) -> ExamOut:
     for q in exam.questions:
         choices_out = [ChoiceOut(text=c.text) for c in q.choices]
         questions_out.append(
-            QuestionOut(id=q.id, text=q.text, choices=choices_out, correct=q.correct_answer)
+            QuestionOut(
+                id=q.id,
+                text=q.text,
+                choices=choices_out,
+                correct=_question_correct(q),
+                points=q.points,
+            )
         )
 
     form = ExamFormOut(
@@ -102,7 +146,15 @@ def _exam_to_response(exam: Exam) -> ExamOut:
         instructions=exam.instructions,
     )
 
-    students = [s.name for s in exam.students]
+    students = [
+        StudentOut(
+            firstName=s.first_name,
+            lastName=s.last_name,
+            group=s.group_name,
+            registrationNumber=s.registration_number,
+        )
+        for s in exam.students
+    ]
 
     return ExamOut(
         id=exam.id,
@@ -149,11 +201,14 @@ class ExamService:
         await db.flush()
 
         for qi, q_in in enumerate(payload.questions):
+            correct = sorted(set(q_in.correct or []))
             question = Question(
                 exam_id=exam.id,
                 order_index=qi,
                 text=q_in.text,
-                correct_answer=q_in.correct,
+                correct_answers=correct,
+                correct_answer=correct[0] if correct else None,
+                points=q_in.points,
             )
             db.add(question)
             await db.flush()
@@ -161,8 +216,8 @@ class ExamService:
             for ci, c_in in enumerate(q_in.choices):
                 db.add(Choice(question_id=question.id, order_index=ci, text=c_in.text))
 
-        for name in payload.students:
-            db.add(ExamStudent(exam_id=exam.id, name=name))
+        for s_in in payload.students:
+            db.add(_build_student(exam.id, s_in))
 
         await db.commit()
 
@@ -218,11 +273,14 @@ class ExamService:
         await db.flush()
 
         for qi, q_in in enumerate(payload.questions):
+            correct = sorted(set(q_in.correct or []))
             question = Question(
                 exam_id=exam.id,
                 order_index=qi,
                 text=q_in.text,
-                correct_answer=q_in.correct,
+                correct_answers=correct,
+                correct_answer=correct[0] if correct else None,
+                points=q_in.points,
             )
             db.add(question)
             await db.flush()
@@ -234,8 +292,8 @@ class ExamService:
         exam.students.clear()
         await db.flush()
 
-        for name in payload.students:
-            exam.students.append(ExamStudent(exam_id=exam.id, name=name))
+        for s_in in payload.students:
+            exam.students.append(_build_student(exam.id, s_in))
 
         await db.commit()
         await db.refresh(exam, ["students", "questions"])
@@ -272,13 +330,12 @@ class ExamService:
     async def list_to_correct(
         db: AsyncSession, user_id: uuid.UUID, search: str | None = None
     ) -> list[MobileExamOut]:
+        # All of the teacher's exams are correctable — even fully-graded ones,
+        # since more student copies can always be scanned and added later.
         query = (
             select(Exam)
             .options(selectinload(Exam.submissions))
-            .where(
-                Exam.user_id == user_id,
-                Exam.status.in_([ExamStatus.draft, ExamStatus.ready, ExamStatus.in_progress]),
-            )
+            .where(Exam.user_id == user_id)
             .order_by(Exam.created_at.desc())
         )
         if search:
@@ -332,7 +389,19 @@ class ExamService:
         exam = await ExamService._load_for_grading(db, exam_id, user_id)
 
         images = _extract_images(files)
+        failed: list[dict[str, str]] = []
         for filename, content in images:
+            # Reject sheets we can't segment up front: don't store or grade them,
+            # so the client can cleanly retry just those (no half-ingested rows).
+            reason = (
+                _segmentation_reason(content, filename)
+                if settings.segmentation_precheck
+                else None
+            )
+            if reason is not None:
+                failed.append({"filename": filename, "reason": reason})
+                continue
+
             key = storage.build_key(exam.id, filename)
             await storage.put_object(key, content, _content_type(filename))
 
@@ -343,7 +412,10 @@ class ExamService:
         _recompute_aggregates(exam)
         await db.commit()
 
-        return await ExamService.get_mobile(db, exam_id, user_id)
+        mobile = await ExamService.get_mobile(db, exam_id, user_id)
+        return mobile.model_copy(
+            update={"failedSheets": [FailedSheetOut(**f) for f in failed]}
+        )
 
     @staticmethod
     async def regrade_pending(
@@ -365,6 +437,41 @@ class ExamService:
         return await ExamService.get_mobile(db, exam_id, user_id)
 
     @staticmethod
+    async def export_results_xlsx(
+        db: AsyncSession, exam_id: uuid.UUID, user_id: uuid.UUID
+    ) -> tuple[bytes, str]:
+        """Build an .xlsx list of the exam's graded students. Returns (bytes, title)."""
+        from openpyxl import Workbook
+
+        exam = await ExamService._load_for_grading(db, exam_id, user_id)
+        # Look up each submission's group from the roster (matched by reg number).
+        by_reg = {
+            str(s.registration_number): s
+            for s in exam.students
+            if s.registration_number
+        }
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Grades"
+        ws.append(
+            ["First Name", "Last Name", "Group", "Registration Number",
+             "Score", "Max Score", "Percentage", "Needs Review"]
+        )
+        for sub in exam.submissions:
+            student = by_reg.get(str(sub.student_id))
+            group = student.group_name if student else ""
+            pct = round(sub.score / sub.max_score * 100, 1) if sub.max_score else 0
+            ws.append([
+                sub.first_name, sub.last_name, group, sub.student_id,
+                sub.score, sub.max_score, pct, "yes" if sub.needs_review else "",
+            ])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue(), exam.title
+
+    @staticmethod
     async def _load_for_grading(
         db: AsyncSession, exam_id: uuid.UUID, user_id: uuid.UUID
     ) -> Exam:
@@ -373,6 +480,7 @@ class ExamService:
             .options(
                 selectinload(Exam.submissions),
                 selectinload(Exam.questions),
+                selectinload(Exam.students),
             )
             .where(Exam.id == exam_id, Exam.user_id == user_id)
         )
@@ -382,26 +490,39 @@ class ExamService:
         return exam
 
 
-def _answer_key(exam: Exam) -> list[int | None]:
-    """Correct choice index per question, ordered by Question.order_index."""
-    return [q.correct_answer for q in exam.questions]
+def _correct_set(q) -> set:
+    """Correct choice indices for a question (multiple-correct supported)."""
+    if q.correct_answers:
+        return {int(a) for a in q.correct_answers}
+    return {int(q.correct_answer)} if q.correct_answer is not None else set()
+
+
+def _question_correct(q) -> list[int]:
+    """Correct choice indices as a sorted list (for API output)."""
+    return sorted(_correct_set(q))
+
+
+def _gradeable_max(exam: Exam) -> int:
+    """Total points over questions that have a correct answer set."""
+    return sum(q.points for q in exam.questions if _correct_set(q))
 
 
 def _derive_score(result: GradingResult, exam: Exam) -> tuple[int, int]:
     """Score a result from its detected answers vs the answer key.
 
-    Used only when the model didn't return its own score/max_score. Each
-    question with a defined correct answer is worth one point.
+    Used only when the model didn't return its own score/max_score (the bubble
+    pipeline scores itself). Single-answer match: a question is correct when its
+    single detected answer equals its (single) correct choice.
     """
-    key = _answer_key(exam)
-    gradeable = [k for k in key if k is not None]
-    max_score = len(gradeable)
+    questions = sorted(exam.questions, key=lambda q: q.order_index)
+    max_score = _gradeable_max(exam)
     score = sum(
-        1
-        for i, correct in enumerate(key)
-        if correct is not None
+        q.points
+        for i, q in enumerate(questions)
+        if _correct_set(q)
         and i < len(result.answers)
-        and result.answers[i] == correct
+        and result.answers[i] is not None
+        and {result.answers[i]} == _correct_set(q)
     )
     return score, max_score
 
@@ -416,8 +537,10 @@ def _apply_grading(submission: StudentSubmission, image: bytes, exam: Exam) -> N
     except GradingNotAvailable:
         submission.status = "pending"
         submission.score = 0
-        submission.max_score = len([q for q in exam.questions if q.correct_answer is not None])
+        submission.max_score = _gradeable_max(exam)
         submission.confidence = 0.0
+        submission.needs_review = False
+        submission.flagged_questions = []
         return
 
     score, max_score = result.score, result.max_score
@@ -428,6 +551,8 @@ def _apply_grading(submission: StudentSubmission, image: bytes, exam: Exam) -> N
     submission.score = score
     submission.max_score = max_score
     submission.confidence = result.confidence
+    submission.needs_review = result.needs_review
+    submission.flagged_questions = result.flagged_questions
     submission.first_name = result.first_name
     submission.last_name = result.last_name
     submission.student_id = result.student_id
@@ -466,6 +591,8 @@ def _exam_to_mobile(exam: Exam) -> MobileExamOut:
             score=s.score,
             maxScore=s.max_score,
             confidence=s.confidence,
+            needsReview=bool(s.needs_review),
+            flaggedQuestions=s.flagged_questions or [],
         )
         for s in exam.submissions
     ]

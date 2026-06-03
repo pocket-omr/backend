@@ -7,6 +7,17 @@ router = APIRouter(prefix="/students", tags=["students"])
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 
+# Header keywords (lowercased, substring match) that identify each column.
+# Order matters: first_name is matched before last_name so "prenom" doesn't
+# get swallowed by the French "nom" used for last names.
+_FIRST_KW = ("first", "prenom", "prénom", "given")
+_LAST_KW = ("last", "surname", "family")
+_GROUP_KW = ("group", "groupe", "section", "class", "classe")
+_REG_KW = ("regist", "matricule", "number", "num", "registration")
+
+# Field order used for positional fallback when the file has no header row.
+_FIELDS = ("first_name", "last_name", "group", "registration_number")
+
 
 def _get_extension(filename: str) -> str:
     return ("." + filename.rsplit(".", 1)[-1]).lower() if "." in filename else ""
@@ -14,57 +25,73 @@ def _get_extension(filename: str) -> str:
 
 def _has_header(header: list[str]) -> bool:
     joined = " ".join(header)
-    return "first" in joined or "last" in joined or "name" in joined
+    keywords = ("first", "last", "name", "nom", *_GROUP_KW, *_REG_KW)
+    return any(kw in joined for kw in keywords)
 
 
-def _detect_columns(header: list[str], ncols: int) -> tuple[int, int | None]:
-    first_col = None
-    last_col = None
+def _detect_columns(header: list[str]) -> dict[str, int]:
+    """Map each known field to a column index, by header keyword."""
+    cols: dict[str, int] = {}
     for i, h in enumerate(header):
-        if "first" in h:
-            first_col = i
-        elif "last" in h:
-            last_col = i
-    if first_col is None and last_col is None:
-        first_col = 0
-        last_col = 1 if ncols > 1 else None
-    if first_col is None:
-        first_col = 0
-    if last_col is None and ncols > 1:
-        last_col = 1
-    return first_col, last_col
+        if "first_name" not in cols and any(kw in h for kw in _FIRST_KW):
+            cols["first_name"] = i
+        elif "last_name" not in cols and (any(kw in h for kw in _LAST_KW) or h == "nom"):
+            cols["last_name"] = i
+        elif "group" not in cols and any(kw in h for kw in _GROUP_KW):
+            cols["group"] = i
+        elif "registration_number" not in cols and any(kw in h for kw in _REG_KW):
+            cols["registration_number"] = i
+    # A lone generic "name" column (no first/last detected) → first_name.
+    if "first_name" not in cols:
+        for i, h in enumerate(header):
+            if "name" in h and i not in cols.values():
+                cols["first_name"] = i
+                break
+    return cols
 
 
-def _extract_name(cells: list, first_col: int, last_col: int | None) -> dict[str, str] | None:
-    first = str(cells[first_col] or "").strip() if first_col < len(cells) else ""
-    last = ""
-    if last_col is not None and last_col < len(cells):
-        last = str(cells[last_col] or "").strip()
-    if first or last:
-        return {"first_name": first, "last_name": last}
-    return None
+def _positional_columns(ncols: int) -> dict[str, int]:
+    return {field: i for i, field in enumerate(_FIELDS) if i < ncols}
+
+
+def _extract_student(cells: list, cols: dict[str, int]) -> dict[str, str] | None:
+    def val(field: str) -> str:
+        i = cols.get(field)
+        if i is None or i >= len(cells):
+            return ""
+        return str(cells[i] or "").strip()
+
+    entry = {
+        "first_name": val("first_name"),
+        "last_name": val("last_name"),
+        "group": val("group"),
+        "registration_number": val("registration_number"),
+    }
+    return entry if any(entry.values()) else None
+
+
+def _columns_for(header: list[str], ncols: int) -> tuple[dict[str, int], bool]:
+    """Return (column map, header_found)."""
+    if _has_header(header):
+        return _detect_columns(header), True
+    return _positional_columns(ncols), False
 
 
 def _parse_csv(content: bytes) -> list[dict[str, str]]:
     text = content.decode("utf-8-sig")
-    reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
+    rows = list(csv.reader(io.StringIO(text)))
     if not rows:
         return []
 
     header = [h.strip().lower() for h in rows[0]]
-    header_found = _has_header(header)
+    cols, header_found = _columns_for(header, len(rows[0]))
     start = 1 if header_found else 0
-    if header_found:
-        first_col, last_col = _detect_columns(header, len(header))
-    else:
-        first_col, last_col = 0, (1 if len(rows[0]) > 1 else None)
 
     students = []
     for row in rows[start:]:
         if not any(cell.strip() for cell in row):
             continue
-        entry = _extract_name(row, first_col, last_col)
+        entry = _extract_student(row, cols)
         if entry:
             students.append(entry)
     return students
@@ -73,9 +100,7 @@ def _parse_csv(content: bytes) -> list[dict[str, str]]:
 def _parse_xlsx(content: bytes) -> list[dict[str, str]]:
     import openpyxl
 
-    wb = openpyxl.load_workbook(
-        io.BytesIO(content), read_only=True, data_only=True
-    )
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     ws = wb.active
     if ws is None:
         return []
@@ -86,19 +111,15 @@ def _parse_xlsx(content: bytes) -> list[dict[str, str]]:
         return []
 
     header = [str(h or "").strip().lower() for h in rows[0]]
-    header_found = _has_header(header)
+    cols, header_found = _columns_for(header, len(rows[0]))
     start = 1 if header_found else 0
-    ncols = len(rows[0])
-    first_col, last_col = (
-        _detect_columns(header, ncols) if header_found else (0, 1 if ncols > 1 else None)
-    )
 
     students = []
     for row in rows[start:]:
         cells = [str(c or "") for c in row]
         if not any(c.strip() for c in cells):
             continue
-        entry = _extract_name(cells, first_col, last_col)
+        entry = _extract_student(cells, cols)
         if entry:
             students.append(entry)
     return students
@@ -112,23 +133,16 @@ def _parse_xls(content: bytes) -> list[dict[str, str]]:
     if ws.nrows == 0:
         return []
 
-    header = [
-        str(ws.cell_value(0, c)).strip().lower() for c in range(ws.ncols)
-    ]
-    header_found = _has_header(header)
+    header = [str(ws.cell_value(0, c)).strip().lower() for c in range(ws.ncols)]
+    cols, header_found = _columns_for(header, ws.ncols)
     start = 1 if header_found else 0
-    first_col, last_col = (
-        _detect_columns(header, ws.ncols)
-        if header_found
-        else (0, 1 if ws.ncols > 1 else None)
-    )
 
     students = []
     for r in range(start, ws.nrows):
         cells = [str(ws.cell_value(r, c)) for c in range(ws.ncols)]
         if not any(c.strip() for c in cells):
             continue
-        entry = _extract_name(cells, first_col, last_col)
+        entry = _extract_student(cells, cols)
         if entry:
             students.append(entry)
     return students
@@ -136,7 +150,12 @@ def _parse_xls(content: bytes) -> list[dict[str, str]]:
 
 @router.post("/parse-file")
 async def parse_student_file(file: UploadFile = File(...)):
-    """Parse an uploaded Excel/CSV file and return student names."""
+    """Parse an uploaded Excel/CSV roster → student records.
+
+    Each record carries first_name, last_name, group and registration_number;
+    columns are detected from header keywords, falling back to positional order
+    (first, last, group, registration) when the file has no header row.
+    """
     filename = file.filename or ""
     ext = _get_extension(filename)
 
@@ -163,8 +182,6 @@ async def parse_student_file(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to parse file: {e}"
-        ) from e
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {e}") from e
 
     return {"students": students, "count": len(students)}
